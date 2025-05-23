@@ -186,7 +186,7 @@
         </div>
     </div>
 
-    <script>
+<script>
         // Configuration
         const CLOUDINARY_CONFIG = {
             cloudName: 'djkngfvee',
@@ -210,6 +210,9 @@
         let db, auth;
         let currentEditingId = null;
         let currentDeletingId = null;
+        let imagesListener = null;
+        let isInitialLoad = true;
+        let searchTerm = '';
 
         // Initialize Firebase
         try {
@@ -300,8 +303,8 @@
                 userEmail.classList.add('hidden');
                 adminPanel.classList.add('hidden');
             }
-            // Reload images to show/hide admin buttons
-            loadImages();
+            // Setup real-time listener
+            setupRealtimeListener();
         });
 
         function clearLoginForm() {
@@ -457,13 +460,13 @@
                     url: data.secure_url,
                     publicId: data.public_id,
                     uploadedBy: currentUser.email,
-                    uploadedAt: new Date(),
+                    uploadedAt: firebase.firestore.FieldValue.serverTimestamp(),
                     tags: title.toLowerCase().split(' ').filter(tag => tag.length > 0)
                 };
 
                 console.log('Image data to save:', imageData);
 
-                // Add document to Firestore
+                // Add document to Firestore - Real-time listener will automatically update UI
                 const docRef = await db.collection('images').add(imageData);
                 console.log('Document written with ID:', docRef.id);
 
@@ -480,8 +483,8 @@
                     progressBar.style.width = '0%';
                 }, 2000);
 
-                // Refresh images
-                await loadImages();
+                // Show success notification
+                showNotification('Image uploaded successfully!', 'success');
                 
             } catch (error) {
                 console.error('Upload error:', error);
@@ -517,6 +520,139 @@
             }
         }
 
+        // Real-time listener setup
+        function setupRealtimeListener() {
+            // Clean up previous listener
+            if (imagesListener) {
+                console.log('Cleaning up previous listener');
+                imagesListener();
+                imagesListener = null;
+            }
+
+            console.log('Setting up real-time listener...');
+            loading.classList.remove('hidden');
+            imagesGrid.classList.add('hidden');
+            noImages.classList.add('hidden');
+
+            try {
+                // Set up real-time listener with ordering
+                imagesListener = db.collection('images')
+                    .orderBy('uploadedAt', 'desc')
+                    .onSnapshot(
+                        (snapshot) => {
+                            console.log('Real-time update received:', snapshot.size, 'documents');
+                            
+                            allImages = [];
+                            const changes = snapshot.docChanges();
+                            
+                            // Log the type of changes
+                            changes.forEach(change => {
+                                console.log(`Document ${change.type}:`, change.doc.id);
+                                if (change.type === 'added') {
+                                    // showNotification('New image added!', 'info');
+                                } else if (change.type === 'modified') {
+                                    showNotification('Image updated!', 'info');
+                                } else if (change.type === 'removed') {
+                                    showNotification('Image deleted!', 'warning');
+                                }
+                            });
+
+                            snapshot.forEach(doc => {
+                                const data = doc.data();
+                                allImages.push({
+                                    id: doc.id,
+                                    ...data
+                                });
+                            });
+
+                            console.log('Updated images array:', allImages.length);
+                            
+                            // Apply current search filter if any
+                            if (searchTerm) {
+                                const filteredImages = filterImages(allImages, searchTerm);
+                                displayImages(filteredImages);
+                            } else {
+                                displayImages(allImages);
+                            }
+
+                            if (isInitialLoad) {
+                                isInitialLoad = false;
+                                console.log('Initial load completed');
+                            }
+                        },
+                        (error) => {
+                            console.error('Real-time listener error:', error);
+                            
+                            if (error.code === 'permission-denied') {
+                                // Fallback to basic listener without ordering
+                                console.log('Trying fallback listener without ordering...');
+                                setupFallbackListener();
+                            } else {
+                                loading.classList.add('hidden');
+                                noImages.classList.remove('hidden');
+                                showNotification('Failed to load images. Please refresh the page.', 'error');
+                            }
+                        }
+                    );
+                
+                console.log('Real-time listener setup complete');
+                
+            } catch (error) {
+                console.error('Error setting up real-time listener:', error);
+                setupFallbackListener();
+            }
+        }
+
+        // Fallback listener without ordering
+        function setupFallbackListener() {
+            if (imagesListener) {
+                imagesListener();
+            }
+
+            imagesListener = db.collection('images')
+                .onSnapshot(
+                    (snapshot) => {
+                        console.log('Fallback listener update:', snapshot.size, 'documents');
+                        
+                        allImages = [];
+                        
+                        snapshot.forEach(doc => {
+                            const data = doc.data();
+                            allImages.push({
+                                id: doc.id,
+                                ...data
+                            });
+                        });
+                        
+                        // Sort client-side by upload date
+                        allImages.sort((a, b) => {
+                            const getTimestamp = (date) => {
+                                if (!date) return 0;
+                                if (date.seconds) return date.seconds;
+                                if (date.toDate) return date.toDate().getTime() / 1000;
+                                return new Date(date).getTime() / 1000;
+                            };
+                            
+                            return getTimestamp(b.uploadedAt) - getTimestamp(a.uploadedAt);
+                        });
+                        
+                        // Apply search filter if any
+                        if (searchTerm) {
+                            const filteredImages = filterImages(allImages, searchTerm);
+                            displayImages(filteredImages);
+                        } else {
+                            displayImages(allImages);
+                        }
+                    },
+                    (error) => {
+                        console.error('Fallback listener error:', error);
+                        loading.classList.add('hidden');
+                        noImages.classList.remove('hidden');
+                        showNotification('Unable to connect to database. Please check your connection.', 'error');
+                    }
+                );
+        }
+
         function openEditModal(imageId) {
             const image = allImages.find(img => img.id === imageId);
             if (!image) return;
@@ -524,6 +660,7 @@
             currentEditingId = imageId;
             document.getElementById('edit-title').value = image.title;
             document.getElementById('edit-description').value = image.description || '';
+            document.getElementById('edit-error').classList.add('hidden');
             editModal.classList.remove('hidden');
         }
 
@@ -543,16 +680,16 @@
                 document.getElementById('save-edit').textContent = 'Saving...';
                 document.getElementById('save-edit').disabled = true;
 
+                // Update in Firestore - Real-time listener will automatically update UI
                 await db.collection('images').doc(currentEditingId).update({
                     title: title,
                     description: description,
-                    updatedAt: new Date(),
+                    updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
                     updatedBy: currentUser.email
                 });
 
                 editModal.classList.add('hidden');
                 currentEditingId = null;
-                await loadImages();
 
             } catch (error) {
                 console.error('Edit error:', error);
@@ -579,7 +716,7 @@
                 document.getElementById('confirm-delete').textContent = 'Deleting...';
                 document.getElementById('confirm-delete').disabled = true;
 
-                // Delete from Cloudinary
+                // Delete from Cloudinary first
                 if (image.publicId) {
                     try {
                         const response = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CONFIG.cloudName}/image/destroy`, {
@@ -599,80 +736,18 @@
                     }
                 }
 
-                // Delete from Firestore
+                // Delete from Firestore - Real-time listener will automatically update UI
                 await db.collection('images').doc(currentDeletingId).delete();
 
                 deleteModal.classList.add('hidden');
                 currentDeletingId = null;
-                await loadImages();
 
             } catch (error) {
                 console.error('Delete error:', error);
-                alert('Failed to delete image: ' + error.message);
+                showNotification('Failed to delete image: ' + error.message, 'error');
             } finally {
                 document.getElementById('confirm-delete').textContent = 'Delete';
                 document.getElementById('confirm-delete').disabled = false;
-            }
-        }
-
-        async function loadImages() {
-            loading.classList.remove('hidden');
-            imagesGrid.classList.add('hidden');
-            noImages.classList.add('hidden');
-
-            try {
-                console.log('Loading images from Firestore...');
-                
-                const snapshot = await db.collection('images')
-                    .orderBy('uploadedAt', 'desc')
-                    .get();
-                
-                allImages = [];
-                
-                snapshot.forEach(doc => {
-                    const data = doc.data();
-                    allImages.push({
-                        id: doc.id,
-                        ...data
-                    });
-                });
-
-                console.log('Loaded images:', allImages.length);
-                displayImages(allImages);
-                
-            } catch (error) {
-                console.error('Error loading images:', error);
-                loading.classList.add('hidden');
-                
-                if (error.code === 'permission-denied') {
-                    // Try to load without ordering if permission denied
-                    try {
-                        const snapshot = await db.collection('images').get();
-                        allImages = [];
-                        
-                        snapshot.forEach(doc => {
-                            const data = doc.data();
-                            allImages.push({
-                                id: doc.id,
-                                ...data
-                            });
-                        });
-                        
-                        // Sort client-side
-                        allImages.sort((a, b) => {
-                            const dateA = a.uploadedAt ? (a.uploadedAt.seconds || new Date(a.uploadedAt).getTime() / 1000) : 0;
-                            const dateB = b.uploadedAt ? (b.uploadedAt.seconds || new Date(b.uploadedAt).getTime() / 1000) : 0;
-                            return dateB - dateA;
-                        });
-                        
-                        displayImages(allImages);
-                    } catch (fallbackError) {
-                        console.error('Fallback load also failed:', fallbackError);
-                        noImages.classList.remove('hidden');
-                    }
-                } else {
-                    noImages.classList.remove('hidden');
-                }
             }
         }
 
@@ -695,6 +770,9 @@
                         if (image.uploadedAt.seconds) {
                             // Firestore timestamp
                             uploadDate = new Date(image.uploadedAt.seconds * 1000).toLocaleDateString();
+                        } else if (image.uploadedAt.toDate) {
+                            // Firestore timestamp object
+                            uploadDate = image.uploadedAt.toDate().toLocaleDateString();
                         } else {
                             // Regular Date object
                             uploadDate = new Date(image.uploadedAt).toLocaleDateString();
@@ -720,7 +798,7 @@
                 ` : '';
 
                 return `
-                    <div class="glass rounded-xl overflow-hidden hover-scale cursor-pointer fade-in relative">
+                    <div class="glass rounded-xl overflow-hidden hover-scale cursor-pointer fade-in relative" data-image-id="${image.id}">
                         ${adminButtons}
                         <img src="${image.url}" alt="${image.title}" class="w-full h-48 object-cover" loading="lazy" onclick="openImageModal('${image.id}')">
                         <div class="p-4">
@@ -728,11 +806,34 @@
                             <p class="text-gray-300 text-sm line-clamp-2">${image.description || 'No description'}</p>
                             <div class="mt-2 text-xs text-gray-400">
                                 Uploaded: ${uploadDate}
+                                ${image.updatedAt ? `<br>Updated: ${formatDate(image.updatedAt)}` : ''}
                             </div>
                         </div>
                     </div>
                 `;
             }).join('');
+
+            // Add animation to new images
+            setTimeout(() => {
+                document.querySelectorAll('.fade-in').forEach(el => {
+                    el.style.opacity = '1';
+                    el.style.transform = 'translateY(0)';
+                });
+            }, 100);
+        }
+
+        function formatDate(date) {
+            try {
+                if (date.seconds) {
+                    return new Date(date.seconds * 1000).toLocaleDateString();
+                } else if (date.toDate) {
+                    return date.toDate().toLocaleDateString();
+                } else {
+                    return new Date(date).toLocaleDateString();
+                }
+            } catch (e) {
+                return 'Unknown';
+            }
         }
 
         function openImageModal(imageId) {
@@ -745,37 +846,93 @@
             document.getElementById('image-modal').classList.remove('hidden');
         }
 
+        function filterImages(images, searchTerm) {
+            const term = searchTerm.toLowerCase().trim();
+            return images.filter(image => 
+                image.title.toLowerCase().includes(term) ||
+                (image.description && image.description.toLowerCase().includes(term)) ||
+                (image.tags && image.tags.some(tag => tag.includes(term)))
+            );
+        }
+
         function handleSearch() {
-            const searchTerm = searchInput.value.toLowerCase().trim();
+            searchTerm = searchInput.value.toLowerCase().trim();
             
             if (!searchTerm) {
                 displayImages(allImages);
                 return;
             }
 
-            const filteredImages = allImages.filter(image => 
-                image.title.toLowerCase().includes(searchTerm) ||
-                (image.description && image.description.toLowerCase().includes(searchTerm)) ||
-                (image.tags && image.tags.some(tag => tag.includes(searchTerm)))
-            );
-
+            const filteredImages = filterImages(allImages, searchTerm);
             displayImages(filteredImages);
         }
 
-        // Load images on page load
+        // Notification system
+        function showNotification(message, type = 'info') {
+            // Create notification if it doesn't exist
+            let notification = document.getElementById('notification');
+            if (!notification) {
+                notification = document.createElement('div');
+                notification.id = 'notification';
+                notification.className = 'fixed top-4 right-4 z-50 p-4 rounded-lg shadow-lg transform translate-x-full transition-transform duration-300 ease-in-out';
+                document.body.appendChild(notification);
+            }
+
+            // Set notification content and style
+            const colors = {
+                success: 'bg-green-600 text-white',
+                error: 'bg-red-600 text-white',
+                warning: 'bg-yellow-600 text-white',
+                info: 'bg-blue-600 text-white'
+            };
+
+            notification.className = `fixed top-4 right-4 z-50 p-4 rounded-lg shadow-lg transform transition-transform duration-300 ease-in-out ${colors[type] || colors.info}`;
+            notification.textContent = message;
+
+            // Show notification
+            setTimeout(() => {
+                notification.style.transform = 'translateX(0)';
+            }, 100);
+
+            // Hide notification after 3 seconds
+            setTimeout(() => {
+                notification.style.transform = 'translateX(full)';
+            }, 3000);
+        }
+
+        // Connection status monitoring
+        function monitorConnection() {
+            const showConnectionStatus = (online) => {
+                const status = online ? 'Connected' : 'Offline';
+                const type = online ? 'success' : 'warning';
+                showNotification(`${status} - ${online ? 'Real-time updates active' : 'Using cached data'}`, type);
+            };
+
+            window.addEventListener('online', () => {
+                console.log('Network reconnected');
+                showConnectionStatus(true);
+                setupRealtimeListener();
+            });
+
+            window.addEventListener('offline', () => {
+                console.log('Network disconnected');
+                showConnectionStatus(false);
+            });
+        }
+
+        // Initialize on page load
         window.addEventListener('load', () => {
-            console.log('Page loaded, loading images...');
-            loadImages();
+            console.log('Page loaded, initializing...');
+            monitorConnection();
+            // Real-time listener will be set up when auth state changes
         });
 
-        // Handle network errors
-        window.addEventListener('online', () => {
-            console.log('Network reconnected, reloading images...');
-            loadImages();
-        });
-
-        window.addEventListener('offline', () => {
-            console.log('Network disconnected');
+        // Cleanup listeners on page unload
+        window.addEventListener('beforeunload', () => {
+            if (imagesListener) {
+                console.log('Cleaning up listeners...');
+                imagesListener();
+            }
         });
 
         // Close modals when clicking outside
